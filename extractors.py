@@ -4,13 +4,18 @@ import requests
 from config import *
 import json
 from pprint import pprint
+import fool
 
 
+# 规则抽取
 def name_extractor1(flag, dic, line):
     def helper(start, line):
         end = line.find(",", start) if line.find(",", start) != -1 else line.find("。", start)
-        if end == -1: end = len(line)
+        if end == -1:
+            end = len(line)
         name = line[start: end].strip().strip(":").strip().split()
+        if not name:
+            return None
         return name[0] if ":" not in name[0] else name[0].split(":")[1]
 
     # 0是原告，1是被告
@@ -40,29 +45,32 @@ def name_extractor1(flag, dic, line):
     return dic
 
 
-# 用NER模型辅助抽取地址
-def name_extractor2(lines: list) -> dict:
+# 用NER模型辅助抽取
+def name_extractor2(sub: dict, obj1: dict, obj2: dict, lines: list):
     # eg:[[1, 4], [5, 6], [7, 10]]
     role = ["申请人"]
     part = [[1]]
     # 文本分段
     for i, line in enumerate(lines):
-        if "委托申请人" in line:
+        if "申请事项" in line or "诉讼请求" in line or "仲裁请求" in line or "诉讼申请" in line \
+                or "申请请求" in line or "申请要求" in line or "申请仲裁事项" in line or "请求事项" in line or "仲裁要求" in line:
+            part[-1].append(i - 1)
+            break
+        elif "委托申请人" in line:
             role.append("委托申请人")
             part[-1].append(i - 1)
             part.append([i])
         elif "被申请人" in line or "被申请方" in line or "被申请单位" in line:
+            # 可能出现line = 被申请人: 这种情况
+            if "被申请人:" == line.strip() or "被申请方:" == line.strip() or "被申请单位:" == line.strip():
+                continue
             if "被申请人一" not in role:
                 role.append("被申请人一")
             else:
                 role.append("被申请人二")
             part[-1].append(i - 1)
             part.append([i])
-        elif "申请事项" in line or "诉讼请求" in line or "仲裁请求" in line or "诉讼申请" in line \
-                or "申请请求" in line or "申请要求" in line or "申请仲裁事项" in line or "请求事项" in line or "仲裁要求" in line:
-            part[-1].append(i - 1)
-            break
-
+    # print(part)
     name_list = []
     # 每一段提取姓名信息
     for para in part:
@@ -76,22 +84,52 @@ def name_extractor2(lines: list) -> dict:
         # pprint(r)
         entity_list = r["data"]["entity_list"]
         for dic in entity_list:
-            if dic["entity_type"] == "人名":
+            if dic["entity_type"] == "人名" and dic["entity"] not in entity_list:
                 # [人名位置, 人名]
                 names.append([dic["entity_index"]["begin"], dic["entity"]])
+
+        # 如果，NER模型没抽出来，用foolnltk辅助抽取
+        if not names:
+            # [(3, 4, "person", "张三")]
+            res = fool.analysis(txt)[1][0]
+            for t in res:
+                if "person" in t:
+                    names.append([t[0], t[3].strip()])
+
+        # 按姓名的start index排序, names = [[2, 张三], [4, 王五]]
         names.sort(key=sort_function)
-        name_list.append(names)
+        use = []
+        for name in names:
+            use.append(name[1])
+        name_list.append(use)
 
-        # TODO
-        # 规则提取
-
-
+    # res -> {'委托申请人': ['朱荣贵'], '申请人': ['冯明显'], '被申请人一': ['孙辉']}
     res = {}
     for r, n in zip(role, name_list):
         res[r] = n
-    print(part)
-    pprint(res)
-    return res
+    # pprint(res)
+
+    # 将res中的结果保存到csv中
+    for key in res.keys():
+        if key == "申请人":
+            sub["姓名"] = res[key][0] if res[key] else None
+        elif key == "委托申请人":
+            sub["委托申请人"] = res[key][0] if res[key] else None
+        # 被申请人都是公司，这里人名都是法人和其他相关人士
+        elif key == "被申请人一":
+            for i, name in enumerate(res[key]):
+                if i == 0:
+                    obj1["法人姓名"] = name
+                else:
+                    obj1["单位联系人"] = name
+        elif key == "被申请人二":
+            for i, name in enumerate(res[key]):
+                if i == 0:
+                    obj2["法人姓名"] = name
+                else:
+                    obj2["单位联系人"] = name
+
+    return sub, obj1, obj2, part
 
 
 def creditCode_extractor(dic, line):
@@ -101,7 +139,8 @@ def creditCode_extractor(dic, line):
         if end == -1: end = len(line)
         code = line[start: end].strip("\t").strip("\n").split("法定代表人")[0]
         if len(code) > 10:
-            dic["统一社会信用代码"] = code.split("联系电话")[0]
+            code = code.split("联系电话")[0].split()
+            dic["统一社会信用代码"] = code[1] if len(code) > 1 else code[0]
     return dic
 
 
@@ -223,7 +262,7 @@ def nation_extractor(dic, line):
 
 def address_extractor(dic, line):
     def helper(address):
-        lst = ["统一信用代码", "身份证", "电话"]
+        lst = ["统一信用代码", "身份证", "电话", "联系电话", "法定代表人", "邮编", "家庭", "注册地址", "统一社会信用代码"]
         for s in lst:
             if s in address:
                 address = address[0: address.find(s)]
@@ -241,47 +280,39 @@ def address_extractor(dic, line):
     line = line.strip().rstrip("身份证住址:").rstrip("注册地址:").rstrip("住所地:").rstrip("住所:")
     if ("省" in line and "市" in line) or ("省" in line and "县" in line):
         start = line.find("省") - 2 if line.find("省") - 2 > 0 else 0
-        end1 = line.find(" ", start) if line.find(" ", start) != -1 else float("inf")
-        end2 = line.find(",", start) if line.find(",", start) != -1 else float("inf")
-        end3 = line.find("。", start) if line.find("。", start) != -1 else float("inf")
-        if end1 == end2 == end3 == float("inf"):
+        end = line.find(",", start) if line.find(",", start) != -1 else line.find("。", start)
+        if end == -1:
             end = len(line)
-        else:
-            end = min(end1, end2, end3)
-        address = line[start: end].strip("\t").strip("\n").strip("注册地址:").strip("身份证住址:")
-        dic["地址"] = address
+        address = line[start: end].strip("\t").strip("\n").strip("注册地址:").strip("身份证住址:").strip(":")
+        dic["地址"] = helper(address)
     elif "市" in line and "区" in line:
         start = line.find("市") - 2 if line.find("市") - 2 > 0 else 0
-        end1 = line.find(" ", start) if line.find(" ", start) != -1 else float("inf")
-        end2 = line.find(",", start) if line.find(",", start) != -1 else float("inf")
-        end3 = line.find("。", start) if line.find("。", start) != -1 else float("inf")
-        if end1 == end2 == end3 == float("inf"):
+        end = line.find(",", start) if line.find(",", start) != -1 else line.find("。", start)
+        if end == -1:
             end = len(line)
-        else:
-            end = min(end1, end2, end3)
-        address = line[start: end].strip("\t").strip("\n").strip("注册地址:").strip("身份证住址:")
-        dic["地址"] = address
+        address = line[start: end].strip("\t").strip("\n").strip("注册地址:").strip("身份证住址:").strip(":")
+        dic["地址"] = helper(address)
     elif "地址" in line:
         start = line.rfind("地址") + 3
         end = line.find(",", start) if line.find(",", start) != -1 else line.find("。", start)
-        if end == -1: end = len(line)
+        if end == -1:
+            end = len(line)
         address = line[start: end].strip("\t").strip("\n").strip("注册地址:").strip("身份证住址:")
-        address = helper(address).split(" ")
-        dic["地址"] = address[helper2(address)]
+        dic["地址"] = helper(address)
     elif "住址" in line:
         start = line.rfind("住址") + 3
         end = line.find(",", start) if line.find(",", start) != -1 else line.find("。", start)
-        if end == -1: end = len(line)
+        if end == -1:
+            end = len(line)
         address = line[start: end].strip("\t").strip("\n").strip("注册地址:").strip("身份证住址:")
-        address = helper(address).split(" ")
-        dic["地址"] = address[helper2(address)]
+        dic["地址"] = helper(address)
     elif "住所地" in line or "住所" in line:
         start = line.rfind("住所") + 3
         end = line.find(",", start) if line.find(",", start) != -1 else line.find("。", start)
-        if end == -1: end = len(line)
+        if end == -1:
+            end = len(line)
         address = line[start: end].strip("\t").strip("\n").strip("注册地址:").strip("身份证住址:").strip(":")
-        address = helper(address).split(" ")
-        dic["地址"] = address[helper2(address)]
+        dic["地址"] = helper(address)
     return dic
 
 
@@ -365,6 +396,6 @@ def reason_extractor(dic, lines):
 def lines_sort(lines):
     count = 0
     for i, line in enumerate(lines):
-        if len(line.strip()) < 15 and "仲裁申请书" in line:
+        if len(line.strip()) < 15 and ("仲裁申请书" in line or "仲裁反申请书" in line):
             count = i
     return lines[count:] + lines[0: count]
